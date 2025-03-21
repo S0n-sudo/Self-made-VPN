@@ -1,0 +1,515 @@
+import requests
+import time
+import random
+import logging
+import asyncio
+import aiohttp
+from bs4 import BeautifulSoup
+import re
+from collections import defaultdict
+from heapq import heappush, heappop
+import threading
+import socket
+import backoff
+import base64
+import os
+import signal
+import sys
+import hashlib
+import zlib
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives import hashes, hmac
+from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+from pqcrypto.kem.kyber1024 import generate_keypair, encapsulate, decapsulate
+from stegano import lsb
+from PIL import Image
+from pathlib import Path
+import json
+
+# Configuration
+LOG_FILE = 'ip_changer.log'
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15",
+]
+PROXY_SOURCES = [
+    "https://openproxy.space/api/proxies?type=http&anonymity=elite",
+    "https://openproxy.space/api/proxies?type=socks5&anonymity=elite",
+    "https://www.freeproxy.world/api/proxy?protocol=http&anonymity=elite",
+    "https://api.getproxylist.com/proxy?protocol[]=http&anonymity[]=elite",
+]
+FALLBACK_PROXIES = [
+    "socks5://45.76.149.129:1080",
+    "http://198.199.86.11:8080",
+    "socks5://139.162.78.109:3128",
+]
+TEST_URLS = [
+    "https://httpbin.org/ip",
+    "https://api.ipify.org?format=json",
+    "https://ifconfig.me/ip",
+    "https://icanhazip.com/",
+]
+TARGET_URL = "https://www.google.com"
+BASE_INTERVAL = 5
+RETRY_INTERVAL = 10
+TIMEOUT = 5
+MAX_PROXIES = 500
+PROXY_POOL_SIZE = 20
+ANONYMITY_CHECK_URL = "https://www.whoismyisp.org/"
+MAX_ASYNC_TASKS = 50
+REFRESH_INTERVAL = 300
+HEARTBEAT_FILE = "heartbeat.txt"
+HEARTBEAT_TIMEOUT = 60
+KEY_FILE = "secret.key"
+PUBLIC_KEY_FILE = "public_key.kyber"
+KEY_IMAGE = "key_image.png"
+BASE_IMAGE = "base_image.png"
+SECRET_TOKEN_FILE = "secret.token"
+
+# Logging setup
+logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Encryption
+lock = threading.RLock()
+
+class LockWithTimeout:
+    def __init__(self, lock, timeout=10):
+        self.lock = lock
+        self.timeout = timeout
+
+    def __enter__(self):
+        start = time.time()
+        while not self.lock.acquire(blocking=False):
+            if time.time() - start > self.timeout:
+                raise RuntimeError("Lock timeout exceeded")
+            time.sleep(0.1)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.lock.release()
+
+def obfuscate_input(data, key):
+    return bytes(a ^ b for a, b in zip(data, key * (len(data) // len(key) + 1)))[:len(data)]
+
+PASSWORD = os.getenv("IP_CHANGER_PASS", "YourSuperComplexQuantumPassword123!")
+
+def get_hardware_entropy():
+    return hashlib.sha256(str(os.urandom(32) + str(os.getpid()).encode()).encode()).digest()
+
+def load_or_generate_secret_token():
+    if not os.path.exists(SECRET_TOKEN_FILE):
+        token = os.urandom(32)
+        with open(SECRET_TOKEN_FILE, "wb") as f:
+            f.write(token)
+        logging.info("Generated new secret token.")
+    else:
+        with open(SECRET_TOKEN_FILE, "rb") as f:
+            token = f.read()
+    return token
+
+def derive_key(password, hardware_entropy, secret_token, salt=None):
+    if salt is None:
+        salt = os.urandom(16)
+    password = password or "default_pass_123!"
+    hardware_entropy = hardware_entropy or os.urandom(32)
+    secret_token = secret_token or os.urandom(32)
+    obfuscation_key = hashlib.sha256(salt).digest()
+    combined_input = obfuscate_input(password.encode(), obfuscation_key) + \
+                     obfuscate_input(hardware_entropy, obfuscation_key) + \
+                     obfuscate_input(secret_token, obfuscation_key)
+    try:
+        kdf = Argon2id(
+            salt=salt,
+            memory_cost=65536,
+            time_cost=3,
+            parallelism=4,
+            hash_len=32,
+        )
+        key = kdf.derive(combined_input)
+        hmac_key = os.urandom(32)
+        h = hmac.HMAC(hmac_key, hashes.SHA256())
+        h.update(key + salt)
+        integrity_tag = h.finalize()
+        return key, hmac_key, salt, integrity_tag
+    except MemoryError as e:
+        logging.error(f"Memory error in key derivation: {e}")
+        raise
+
+def hide_key_in_image(private_key):
+    if not Path(BASE_IMAGE).exists() or Image.open(BASE_IMAGE).size[0] * Image.open(BASE_IMAGE).size[1] < 3072:
+        Image.new("RGB", (1024, 1024), "white").save(BASE_IMAGE)
+        logging.warning("Base image too small or missing. Created 1024x1024 fallback.")
+    secret_message = base64.b64encode(private_key).decode()
+    with LockWithTimeout(lock):
+        secret_image = lsb.hide(BASE_IMAGE, secret_message)
+        secret_image.save(KEY_IMAGE)
+
+def extract_key_from_image():
+    try:
+        with LockWithTimeout(lock):
+            secret_message = lsb.reveal(Image.open(KEY_IMAGE))
+        return base64.b64decode(secret_message)
+    except Exception as e:
+        logging.error(f"Failed to extract key from image: {e}")
+        return None
+
+def load_or_generate_kyber_keys():
+    if not (Path(PUBLIC_KEY_FILE).exists() and Path(KEY_IMAGE).exists()):
+        public_key, private_key = generate_keypair()
+        with LockWithTimeout(lock):
+            with open(PUBLIC_KEY_FILE, "wb") as f:
+                f.write(public_key)
+        hide_key_in_image(private_key)
+    else:
+        with open(PUBLIC_KEY_FILE, "rb") as f:
+            public_key = f.read()
+        private_key = extract_key_from_image()
+        if not private_key:
+            logging.error("Regenerating keys due to extraction failure.")
+            return load_or_generate_kyber_keys()
+    return public_key, private_key
+
+hardware_entropy = get_hardware_entropy()
+secret_token = load_or_generate_secret_token()
+try:
+    with LockWithTimeout(lock):
+        with open(KEY_FILE, "rb") as key_file:
+            ciphertext = key_file.read()
+    public_key, private_key = load_or_generate_kyber_keys()
+    shared_secret = decapsulate(private_key, ciphertext)
+    if len(shared_secret) < 80:
+        raise ValueError("Decapsulated secret too short.")
+    salt = shared_secret[:16]
+    key = shared_secret[16:48]
+    hmac_key = shared_secret[48:80]
+    derived_key, derived_hmac_key, _, integrity_tag = derive_key(PASSWORD, hardware_entropy, secret_token, salt)
+    h = hmac.HMAC(derived_hmac_key, hashes.SHA256())
+    h.update(derived_key + salt)
+    h.verify(integrity_tag)
+    if derived_key != key or derived_hmac_key != hmac_key:
+        raise ValueError("Stored keys do not match derived keys.")
+except (FileNotFoundError, ValueError, IndexError, EOFError, hmac.InvalidSignature) as e:
+    logging.warning(f"Key loading failed: {e}. Regenerating keys.")
+    public_key, private_key = load_or_generate_kyber_keys()
+    key, hmac_key, salt, integrity_tag = derive_key(PASSWORD, hardware_entropy, secret_token)
+    shared_secret = salt + key + hmac_key
+    ciphertext, _ = encapsulate(public_key, shared_secret)
+    with LockWithTimeout(lock):
+        with open(KEY_FILE, "wb") as key_file:
+            key_file.write(ciphertext)
+    logging.info("Generated and encapsulated new keys with Kyber-1024.")
+finally:
+    aesgcm = AESGCM(key)
+    obfuscation_key = hashlib.sha256(key).digest()
+
+def encrypt_proxy(proxy):
+    if not proxy or not isinstance(proxy, str):
+        logging.error("Invalid proxy input.")
+        return None
+    nonce = os.urandom(12)
+    plaintext = proxy.encode()
+    ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+    h = hmac.HMAC(hmac_key, hashes.SHA512())
+    h.update(nonce + ciphertext)
+    hmac_tag = h.finalize()
+    encrypted_data = nonce + ciphertext + hmac_tag
+    return base64.urlsafe_b64encode(encrypted_data).decode()
+
+def decrypt_proxy(encrypted_proxy):
+    try:
+        encrypted_data = base64.urlsafe_b64decode(encrypted_proxy)
+        if len(encrypted_data) < 76:
+            raise ValueError("Encrypted data too short.")
+        nonce = encrypted_data[:12]
+        ciphertext = encrypted_data[12:-64]
+        hmac_tag = encrypted_data[-64:]
+        h = hmac.HMAC(hmac_key, hashes.SHA512())
+        h.update(nonce + ciphertext)
+        h.verify(hmac_tag)
+        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+        return plaintext.decode()
+    except ValueError as e:
+        logging.error(f"Decryption failed: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Unexpected decryption error: {e}")
+        return None
+
+# Proxy Management
+class ProxyPool:
+    def __init__(self, max_size):
+        self.pool = []
+        self.max_size = max_size
+        self.lock = threading.Lock()
+        self.banned = defaultdict(float)
+        self.last_refresh = 0
+        self.semaphore = asyncio.Semaphore(MAX_ASYNC_TASKS)
+
+    def add(self, proxy_obj):
+        with self.lock:
+            ban_score = self.banned[proxy_obj.proxy_str]
+            if ban_score > 0.9:
+                return
+            heappush(self.pool, proxy_obj)
+            while len(self.pool) > self.max_size:
+                heappop(self.pool)
+
+    def get_best(self):
+        with self.lock:
+            while self.pool:
+                proxy = heappop(self.pool)
+                if self.banned[proxy.proxy_str] <= 0.9:
+                    heappush(self.pool, proxy)
+                    return proxy.proxy_str
+            return None
+
+    def update_ban(self, proxy_str, increment=0.2):
+        with self.lock:
+            self.banned[proxy_str] = min(self.banned[proxy_str] + increment, 1.0)
+            self.pool = [p for p in self.pool if p.proxy_str != proxy_str]
+            for p in list(self.banned.keys()):
+                self.banned[p] *= 0.95
+                if self.banned[p] < 0.1:
+                    del self.banned[p]
+
+    def needs_refresh(self):
+        return time.time() - self.last_refresh > REFRESH_INTERVAL
+
+proxy_pool = ProxyPool(PROXY_POOL_SIZE)
+
+class Proxy:
+    def __init__(self, proxy_str, protocol):
+        self.proxy_str = proxy_str
+        self.protocol = protocol
+        self.latency = 0.0
+        self.success_count = 0
+        self.failure_count = 0
+        self.timeout_count = 0
+        self.anonymity_score = 0
+        self.last_used = 0.0
+        self.score = 0.0
+        self.fingerprint = hashlib.sha256(proxy_str.encode()).hexdigest()[:8]
+
+    def update_metrics(self, latency=None, success=True, timeout=False):
+        if latency is not None:
+            self.latency = (self.latency * self.success_count + latency) / (self.success_count + 1) if self.success_count else latency
+        if success:
+            self.success_count += 1
+        else:
+            self.failure_count += 1
+        if timeout:
+            self.timeout_count += 1
+        self.calculate_score()
+
+    def calculate_score(self):
+        success_rate = self.success_count / (self.success_count + self.failure_count + 1)
+        latency_penalty = min(self.latency / 5.0, 1.0)
+        timeout_penalty = min(self.timeout_count / 5.0, 1.0)
+        self.score = (0.4 * self.anonymity_score + 0.3 * success_rate - 0.2 * latency_penalty - 0.1 * timeout_penalty)
+
+    def __lt__(self, other):
+        return self.score > other.score
+
+@backoff.on_exception(backoff.expo, Exception, max_tries=3)
+def get_proxies():
+    proxies = set()
+    for source in PROXY_SOURCES:
+        try:
+            headers = {"User-Agent": random.choice(USER_AGENTS)}
+            response = requests.get(source, timeout=TIMEOUT, headers=headers)
+            text = response.text
+            if "openproxy.space" in source:
+                data = json.loads(text)
+                for proxy in data.get("proxies", []):
+                    ip, port = proxy["ip"], proxy["port"]
+                    protocol = "socks5" if "socks5" in source else "http"
+                    proxies.add(encrypt_proxy(f"{protocol}://{ip}:{port}"))
+            elif "freeproxy.world" in source:
+                data = json.loads(text)
+                for proxy in data.get("data", []):
+                    ip, port = proxy["ip"], proxy["port"]
+                    proxies.add(encrypt_proxy(f"http://{ip}:{port}"))
+            elif "getproxylist.com" in source:
+                data = json.loads(text)
+                ip, port = data["ip"], data["port"]
+                proxies.add(encrypt_proxy(f"http://{ip}:{port}"))
+            else:
+                matches = re.findall(r"(\d+\.\d+\.\d+\.\d+):(\d+)", text)
+                for ip, port in matches:
+                    proxies.add(encrypt_proxy(f"http://{ip}:{port}"))
+        except Exception as e:
+            logging.error(f"Error fetching from {source}: {e}")
+    
+    if not proxies:
+        logging.warning("No proxies from sources. Using fallbacks.")
+        proxies.update(encrypt_proxy(p) for p in FALLBACK_PROXIES)
+    
+    return list(proxies)[:MAX_PROXIES]
+
+async def test_proxy_async(session, encrypted_proxy):
+    async with proxy_pool.semaphore:
+        proxy = decrypt_proxy(encrypted_proxy)
+        if not proxy:
+            return None, None, None, None
+        protocol, addr = proxy.split("://", 1)
+        test_url = random.choice(TEST_URLS)
+        start_time = time.time()
+        try:
+            async with session.get(test_url, proxy=proxy, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as response:
+                if response.status == 200:
+                    latency = time.time() - start_time
+                    ip = (await response.text()).strip()
+                    anonymity_score = 2  # Assume elite from sources
+                    if ip == socket.gethostbyname(socket.gethostname()):
+                        anonymity_score = 0
+                    async with session.get(TARGET_URL, proxy=proxy, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as target_resp:
+                        if target_resp.status == 200:
+                            return encrypted_proxy, latency, anonymity_score, False
+        except asyncio.TimeoutError:
+            return encrypted_proxy, None, None, True
+        except Exception:
+            return encrypted_proxy, None, None, False
+        return encrypted_proxy, None, None, False
+
+async def get_working_proxies(proxies):
+    async with aiohttp.ClientSession(headers={"User-Agent": random.choice(USER_AGENTS)}) as session:
+        tasks = [test_proxy_async(session, proxy) for proxy in proxies]
+        batches = [tasks[i:i + MAX_ASYNC_TASKS] for i in range(0, len(tasks), MAX_ASYNC_TASKS)]
+        proxy_objs = []
+        for batch in batches:
+            results = await asyncio.gather(*batch)
+            for proxy, latency, anonymity, timeout in results:
+                if latency is not None:
+                    proxy_obj = Proxy(decrypt_proxy(proxy), proxy.split("://")[0])
+                    proxy_obj.update_metrics(latency, True, False)
+                    proxy_obj.anonymity_score = anonymity or 0
+                    proxy_objs.append(proxy_obj)
+                elif timeout:
+                    proxy_obj = Proxy(decrypt_proxy(proxy), proxy.split("://")[0])
+                    proxy_obj.update_metrics(timeout=True)
+                    proxy_pool.update_ban(proxy_obj.proxy_str)
+        return proxy_objs
+
+def fetch_and_test_proxies():
+    proxies = get_proxies()
+    if not proxies:
+        logging.error("No proxies available even with fallbacks.")
+        return False
+    loop = asyncio.get_event_loop()
+    working_proxies = loop.run_until_complete(get_working_proxies(proxies))
+    for proxy_obj in working_proxies:
+        proxy_pool.add(proxy_obj)
+    proxy_pool.last_refresh = time.time()
+    return bool(working_proxies)
+
+# IP Changer
+def change_ip(max_retries=5):
+    update_heartbeat()
+    retries = 0
+    while retries < max_retries:
+        if proxy_pool.needs_refresh() or not proxy_pool.pool:
+            logging.info("Refreshing proxy pool...")
+            if not fetch_and_test_proxies():
+                retries += 1
+                logging.error(f"Retry {retries}/{max_retries}: Failed to fetch proxies.")
+                time.sleep(RETRY_INTERVAL * (2 ** retries))
+                continue
+        
+        encrypted_proxy = proxy_pool.get_best()
+        if not encrypted_proxy:
+            retries += 1
+            logging.error(f"Retry {retries}/{max_retries}: No viable proxies.")
+            time.sleep(RETRY_INTERVAL * (2 ** retries))
+            continue
+        
+        proxy = decrypt_proxy(encrypted_proxy)
+        if not proxy:
+            proxy_pool.update_ban(encrypted_proxy)
+            retries += 1
+            continue
+        
+        start_time = time.time()
+        try:
+            headers = {"User-Agent": random.choice(USER_AGENTS)}
+            proxies_dict = {proxy.split("://")[0]: proxy}
+            response = requests.get(TARGET_URL, proxies=proxies_dict, timeout=TIMEOUT, headers=headers)
+            if response.status_code == 200:
+                latency = time.time() - start_time
+                proxy_obj = Proxy(proxy, proxy.split("://")[0])
+                proxy_obj.update_metrics(latency, True)
+                proxy_pool.add(proxy_obj)
+                interval = min(BASE_INTERVAL + latency * 10 + random.uniform(0, 5), 35)
+                logging.info(f"IP changed to: {proxy} (latency: {latency:.2f}s, interval: {interval}s)")
+                return True, interval
+        except requests.Timeout:
+            proxy_obj = Proxy(proxy, proxy.split("://")[0])
+            proxy_obj.update_metrics(timeout=True)
+            proxy_pool.update_ban(proxy)
+            logging.warning(f"Proxy timed out: {proxy}")
+        except Exception as e:
+            proxy_obj = Proxy(proxy, proxy.split("://")[0])
+            proxy_obj.update_metrics(success=False)
+            proxy_pool.update_ban(proxy)
+            logging.warning(f"Proxy failed: {proxy} - {e}")
+        retries += 1
+        time.sleep(RETRY_INTERVAL * (2 ** retries))
+    
+    logging.error("Max retries reached. Falling back or exiting.")
+    return False, RETRY_INTERVAL
+
+# Supporting Functions
+heartbeat_counter = 0
+def heartbeat_monitor():
+    global heartbeat_counter
+    while True:
+        if heartbeat_counter <= 0 or (time.time() - os.path.getmtime(HEARTBEAT_FILE) > HEARTBEAT_TIMEOUT * 1.5):
+            logging.error("Heartbeat timeout! Wiping keys and exiting...")
+            for f in [KEY_FILE, SECRET_TOKEN_FILE, KEY_IMAGE]:
+                if os.path.exists(f):
+                    os.remove(f)
+            sys.exit(1)
+        heartbeat_counter = max(0, heartbeat_counter - 1)
+        time.sleep(5)
+
+def update_heartbeat():
+    global heartbeat_counter
+    heartbeat_counter = 5
+    with LockWithTimeout(lock):
+        with open(HEARTBEAT_FILE, "w") as f:
+            f.write(str(time.time()))
+
+def signal_handler(sig, frame):
+    logging.info("Shutting down IP rotation...")
+    if os.path.exists(HEARTBEAT_FILE):
+        os.remove(HEARTBEAT_FILE)
+    sys.exit(0)
+
+def verify_integrity():
+    critical_code = (
+        derive_key.__code__.co_code +
+        encrypt_proxy.__code__.co_code +
+        change_ip.__code__.co_code
+    )
+    checksum = hashlib.sha256(critical_code).hexdigest()
+    expected = "YOUR_CRITICAL_CHECKSUM"  # Replace after finalizing
+    if checksum != expected:
+        logging.error("Critical code integrity compromised!")
+        sys.exit(1)
+
+def main():
+    verify_integrity()
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    threading.Thread(target=heartbeat_monitor, daemon=True).start()
+    update_heartbeat()
+    logging.info("Starting IP rotation with dead-man’s switch...")
+    while True:
+        success, interval = change_ip()
+        if success:
+            time.sleep(interval)
+        else:
+            time.sleep(interval)
+
+if __name__ == "__main__":
+    main()
