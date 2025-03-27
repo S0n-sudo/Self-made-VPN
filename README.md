@@ -80,3 +80,6 @@ Notes
 Logs in tor_titan.log.
 Tor runs on 9050, proxy server on 9052.
 Configurable via tor_titan_config.json.
+
+
+credits to https://github.com/SheLovesLqwid/s0n-sudo-VPN-REVAMPED- for making my code better, so that i could see what i can improve (thx <3)
