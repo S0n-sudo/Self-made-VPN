@@ -1,0 +1,691 @@
+import asyncio
+import aiohttp
+import json
+import logging
+import os
+import random
+import socket
+import socks
+import subprocess
+import sys
+import threading
+import time
+from base64 import urlsafe_b64encode, urlsafe_b64decode
+from collections import defaultdict, deque
+from heapq import heappush, heappop
+import hashlib
+import psutil
+import stem.control
+import stem.process
+from stem import Signal
+from cryptography.hazmat.primitives.ciphers.aead import AESGCMSIV, ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+from cryptography.hazmat.primitives import hashes, hmac
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Optional, Tuple
+
+# Config
+CONFIG_FILE = 'tor_titan_config.json'
+DEFAULT_CONFIG = {
+    "log_file": "tor_titan.log",
+    "key_file": "tor_key.bin",
+    "session_file": "tor_session.bin",
+    "tor_port": 9050,
+    "tor_control_port": 9051,
+    "local_proxy_port": 9052,  # Separate from Tor's SOCKS port
+    "proxy_sources": [
+        "https://openproxy.space/api/proxies?type=socks5&anonymity=elite",
+    ],
+    "fallback_proxies": ["socks5://45.76.149.129:1080"],
+    "test_urls": ["https://check.torproject.org/api/ip"],
+    "target_url": "https://www.torproject.org",
+    "max_proxies": 3000,
+    "pool_size": 500,
+    "refresh_interval": 180,
+    "timeout": 3.5,
+    "max_retries": 6,
+    "key_rotation_interval": 7200,
+    "max_bandwidth_mbps": 200,
+    "encryption_mode": "double",
+    "proxy_chain_depth": 4,
+    "obfuscation": True,
+    "traffic_shaping": True,
+    "user_agents": [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124",
+        "Mozilla/5.0 (X11; Linux x86_64) Chrome/91.0.4472.124",
+    ],
+    "password": os.getenv("TOR_PASS", "TorChaos2025!@#Hidden"),
+    "allowed_routes": ["0.0.0.0/0"],
+    "bypass_routes": ["192.168.0.0/16", "10.0.0.0/8"],
+    "use_vpn": False,  # Optional WireGuard support
+}
+
+if not os.path.exists(CONFIG_FILE):
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(DEFAULT_CONFIG, f, indent=4)
+try:
+    with open(CONFIG_FILE, 'r') as f:
+        CONFIG = json.load(f)
+except (json.JSONDecodeError, IOError):
+    logging.error("Config file corrupted, using defaults")
+    CONFIG = DEFAULT_CONFIG
+
+# Logging
+logging.basicConfig(
+    filename=CONFIG["log_file"],
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - [%(threadName)s:%(lineno)d] - %(message)s'
+)
+
+# Global Resources
+lock = threading.Lock()
+executor = ThreadPoolExecutor(max_workers=32)
+
+# Crypto Core
+class TORTitanCrypto:
+    def __init__(self):
+        self.last_rotation = 0
+        self.entropy_pool = b""
+        self.mode = CONFIG["encryption_mode"]
+        self.session_key = None
+        self._load_session()
+        self._rotate_keys()
+        threading.Thread(target=self._entropy_engine, daemon=True, name="EntropyThread").start()
+
+    def _entropy_engine(self):
+        while True:
+            with lock:
+                entropy = os.urandom(4096) + hashlib.sha512(
+                    str(psutil.cpu_stats()).encode() +
+                    str(psutil.net_io_counters(pernic=True)).encode() +
+                    str(time.time_ns()).encode()
+                ).digest()
+                self.entropy_pool = entropy[-8192:]
+            time.sleep(5)
+
+    def _get_entropy(self):
+        with lock:
+            return self.entropy_pool
+
+    def _derive_key(self):
+        salt = os.urandom(32)
+        kdf = Argon2id(salt=salt, memory_cost=8388608, time_cost=20, parallelism=16, hash_len=256)
+        key = kdf.derive(CONFIG["password"].encode() + self._get_entropy())
+        self.aes_key = key[:64]
+        self.chacha_key = key[64:96]
+        self.hmac_key = key[96:128]
+        self.tor_key = key[128:160]
+        self.session_key = key[192:] if not self.session_key else self.session_key
+        return salt
+
+    def _rotate_keys(self):
+        with lock:
+            salt = self._derive_key()
+            if self.mode == "aes":
+                self.cipher = AESGCMSIV(self.aes_key)
+            elif self.mode == "chacha20":
+                self.cipher = ChaCha20Poly1305(self.chacha_key)
+            else:
+                self.cipher = AESGCMSIV(self.aes_key)
+                self.cipher2 = ChaCha20Poly1305(self.chacha_key)
+            nonce = os.urandom(16)
+            ciphertext = self.cipher.encrypt(nonce, salt + self.tor_key + self.session_key, None)
+            with open(CONFIG["key_file"], 'wb') as f:
+                f.write(nonce + ciphertext)
+            self._save_session()
+            self.last_rotation = time.time()
+            logging.info(f"Keys rotated in {self.mode} mode with session persistence")
+
+    def _load_session(self):
+        try:
+            if os.path.exists(CONFIG["session_file"]):
+                with open(CONFIG["session_file"], 'rb') as f:
+                    self.session_key = f.read()[-64:]
+        except Exception:
+            self.session_key = os.urandom(64)
+
+    def _save_session(self):
+        with open(CONFIG["session_file"], 'wb') as f:
+            nonce = os.urandom(16)
+            f.write(self.cipher.encrypt(nonce, self.session_key, None))
+
+    def encrypt(self, data):
+        if time.time() - self.last_rotation > CONFIG["key_rotation_interval"]:
+            self._rotate_keys()
+        nonce1 = os.urandom(12 if self.mode == "chacha20" else 16)
+        if self.mode == "double":
+            nonce2 = os.urandom(12)
+            inner = self.cipher2.encrypt(nonce2, data.encode(), self.session_key)
+            cipher = self.cipher.encrypt(nonce1, inner, self.session_key)
+            nonce = nonce1 + nonce2
+        else:
+            cipher = self.cipher.encrypt(nonce1, data.encode(), self.session_key)
+            nonce = nonce1
+        h = hmac.HMAC(self.hmac_key, hashes.SHA512())
+        h.update(cipher)
+        tag = h.finalize()
+        return urlsafe_b64encode(nonce + cipher + tag).decode()
+
+    def decrypt(self, encrypted):
+        try:
+            data = urlsafe_b64decode(encrypted)
+            nonce_size = 12 if self.mode == "chacha20" else 16
+            nonce_size += 12 if self.mode == "double" else 0
+            nonce, cipher, tag = data[:nonce_size], data[nonce_size:-64], data[-64:]
+            h = hmac.HMAC(self.hmac_key, hashes.SHA512())
+            h.update(cipher)
+            h.verify(tag)
+            if self.mode == "double":
+                nonce1, nonce2 = nonce[:16], nonce[16:]
+                inner = self.cipher.decrypt(nonce1, cipher, self.session_key)
+                return self.cipher2.decrypt(nonce2, inner, self.session_key).decode()
+            return self.cipher.decrypt(nonce, cipher, self.session_key).decode()
+        except Exception as e:
+            logging.error(f"Decryption failed: {e}")
+            return None
+
+TITAN_CRYPTO = TORTitanCrypto()
+
+# TOR Controller
+class TORController:
+    def __init__(self):
+        self.tor_process = None
+        self.controller = None
+        self.active = False
+        self.start_tor()
+        threading.Thread(target=self._renew_circuit, daemon=True, name="TorCircuitThread").start()
+
+    def start_tor(self):
+        try:
+            os.makedirs("./tor_data", exist_ok=True)
+            self.tor_process = stem.process.launch_tor_with_config(
+                config={
+                    'SocksPort': str(CONFIG["tor_port"]),
+                    'ControlPort': str(CONFIG["tor_control_port"]),
+                    'DataDirectory': './tor_data',
+                },
+                init_msg_handler=lambda line: logging.debug(line)
+            )
+            self.controller = stem.control.Controller.from_port(port=CONFIG["tor_control_port"])
+            self.controller.authenticate()
+            self.active = True
+            logging.info("TOR started successfully")
+        except Exception as e:
+            logging.error(f"TOR startup failed: {e}")
+            self.active = False
+
+    def _renew_circuit(self):
+        while self.active:
+            try:
+                time.sleep(600)
+                self.controller.signal(Signal.NEWNYM)
+                logging.info("TOR circuit renewed")
+            except Exception as e:
+                logging.error(f"Circuit renewal failed: {e}")
+                time.sleep(60)
+
+    def stop_tor(self):
+        if self.tor_process:
+            self.tor_process.kill()
+            self.active = False
+            logging.info("TOR stopped")
+
+TOR = TORController()
+
+# Proxy Pool
+class Proxy:
+    def __init__(self, proxy_str: str):
+        self.proxy_str = proxy_str
+        self.score = 0.0
+        self.latency = float('inf')
+        self.packet_loss = 0.0
+        self.jitter = 0.0
+        self.success = 0
+        self.fails = 0
+        self.last_used = 0
+        self.health = 100
+        self.bandwidth_usage = 0
+
+    def update_score(self, latency=None, packet_loss=None, jitter=None, success=True, bandwidth=0):
+        if latency is not None:
+            self.latency = 0.5 * self.latency + 0.5 * latency if self.latency != float('inf') else latency
+        if packet_loss is not None:
+            self.packet_loss = 0.6 * self.packet_loss + 0.4 * packet_loss
+        if jitter is not None:
+            self.jitter = 0.7 * self.jitter + 0.3 * jitter
+        if success:
+            self.success += 1
+            self.health = min(self.health + 5, 100)
+        else:
+            self.fails += 1
+            self.health = max(self.health - 10, 0)
+        self.bandwidth_usage += bandwidth
+        success_rate = self.success / max(1, self.success + self.fails)
+        latency_score = max(0, 1 - self.latency / 3)
+        loss_score = max(0, 1 - self.packet_loss)
+        jitter_score = max(0, 1 - self.jitter / 0.05)
+        bandwidth_score = max(0, 1 - (self.bandwidth_usage / 5e9))
+        self.score = 0.3 * success_rate + 0.25 * latency_score + 0.2 * loss_score + 0.15 * jitter_score + 0.1 * bandwidth_score
+
+    def __lt__(self, other):
+        return self.score > other.score
+
+class ProxyPool:
+    def __init__(self, max_size: int):
+        self.pool: List[Proxy] = []
+        self.max_size = max_size
+        self.lock = threading.Lock()
+        self.banned = defaultdict(int)
+        self.last_refresh = 0
+        threading.Thread(target=self._heal_pool, daemon=True, name="ProxyHealThread").start()
+
+    def add(self, proxy: Proxy):
+        with self.lock:
+            if self.banned[proxy.proxy_str] < 6:
+                heappush(self.pool, proxy)
+                while len(self.pool) > self.max_size:
+                    heappop(self.pool)
+
+    def get_best(self, chain_depth=1) -> Optional[List[str]]:
+        with self.lock:
+            if len(self.pool) < chain_depth:
+                return None
+            chain = []
+            used = set()
+            for _ in range(len(self.pool)):
+                proxy = heappop(self.pool)
+                if (self.banned[proxy.proxy_str] < 6 and time.time() - proxy.last_used > 25 and
+                    proxy.health > 80 and proxy.proxy_str not in used):
+                    proxy.last_used = time.time()
+                    chain.append(proxy.proxy_str)
+                    used.add(proxy.proxy_str)
+                    heappush(self.pool, proxy)
+                    if len(chain) == chain_depth:
+                        return chain if chain_depth > 1 else chain[0]
+                else:
+                    heappush(self.pool, proxy)
+            return None
+
+    def ban(self, proxy_str: str):
+        with self.lock:
+            self.banned[proxy_str] += 1
+            self.pool = [p for p in self.pool if p.proxy_str != proxy_str]
+
+    def needs_refresh(self):
+        return time.time() - self.last_refresh > CONFIG["refresh_interval"] or len(self.pool) < self.max_size // 5
+
+    async def _test_proxy(self, proxy: Proxy):
+        async with aiohttp.ClientSession(headers={"User-Agent": random.choice(CONFIG["user_agents"])}) as session:
+            try:
+                start = time.time()
+                latencies = []
+                for _ in range(3):
+                    async with session.get(random.choice(CONFIG["test_urls"]), proxy=proxy.proxy_str,
+                                         timeout=aiohttp.ClientTimeout(total=CONFIG["timeout"])) as resp:
+                        if resp.status == 200:
+                            latencies.append(time.time() - start)
+                            start = time.time()
+                latency = sum(latencies) / len(latencies)
+                jitter = max(latencies) - min(latencies) if len(latencies) > 1 else 0.0
+                bandwidth = len(await resp.read())
+                packet_loss = await self._measure_packet_loss(proxy.proxy_str)
+                proxy.update_score(latency, packet_loss, jitter, True, bandwidth)
+            except:
+                proxy.update_score(success=False)
+
+    async def _measure_packet_loss(self, proxy_str: str) -> float:
+        protocol, addr = proxy_str.split("://")
+        host, _ = addr.split(":")
+        try:
+            result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    executor, lambda: subprocess.run(["ping", "-c", "20", "-W", "1", host], capture_output=True, text=True).stdout),
+                timeout=10)
+            loss = float(result.split("%")[0].split()[-1]) / 100 if "packet loss" in result else 0.0
+            return loss
+        except:
+            return 0.4
+
+    def _heal_pool(self):
+        while True:
+            with self.lock:
+                tasks = [self._test_proxy(proxy) for proxy in self.pool if proxy.health < 80 or proxy.fails > 4]
+            if tasks:
+                asyncio.run_coroutine_threadsafe(asyncio.gather(*tasks), asyncio.get_event_loop())
+            time.sleep(8)
+
+POOL = ProxyPool(CONFIG["pool_size"])
+
+# Proxy Fetching
+async def fetch_proxies() -> List[str]:
+    proxies = set()
+    async with aiohttp.ClientSession() as session:
+        tasks = [session.get(url, timeout=aiohttp.ClientTimeout(total=CONFIG["timeout"])) for url in CONFIG["proxy_sources"]]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        for resp in responses:
+            if isinstance(resp, aiohttp.ClientResponse) and resp.status == 200:
+                data = await resp.json()
+                if "openproxy.space" in str(resp.url):
+                    for p in data.get("proxies", []):
+                        proxies.add(f"socks5://{p['ip']}:{p['port']}")
+    proxies.update(CONFIG["fallback_proxies"])
+    return [TITAN_CRYPTO.encrypt(p) for p in proxies][:CONFIG["max_proxies"]]
+
+async def test_proxy(session: aiohttp.ClientSession, encrypted_proxy: str) -> Tuple[Optional[Proxy], float, int, float, float]:
+    proxy_str = TITAN_CRYPTO.decrypt(encrypted_proxy)
+    if not proxy_str:
+        return None, 0, 0, 0, 0
+    start = time.time()
+    try:
+        latencies = []
+        for _ in range(3):
+            async with session.get(random.choice(CONFIG["test_urls"]), proxy=proxy_str,
+                                 timeout=aiohttp.ClientTimeout(total=CONFIG["timeout"])) as resp:
+                if resp.status == 200:
+                    latencies.append(time.time() - start)
+                    start = time.time()
+        if not latencies:
+            return Proxy(proxy_str), None, 0, 0.5, 0.0
+        latency = sum(latencies) / len(latencies)
+        jitter = max(latencies) - min(latencies) if len(latencies) > 1 else 0.0
+        bandwidth = len(await resp.read())
+        packet_loss = await POOL._measure_packet_loss(proxy_str)
+        return Proxy(proxy_str), latency, bandwidth, packet_loss, jitter
+    except:
+        return Proxy(proxy_str), None, 0, 0.5, 0.0
+
+async def refresh_proxies():
+    encrypted_proxies = await fetch_proxies()
+    async with aiohttp.ClientSession(headers={"User-Agent": random.choice(CONFIG["user_agents"])}) as session:
+        try:
+            tasks = [test_proxy(session, p) for p in encrypted_proxies]
+            results = await asyncio.gather(*tasks)
+            for proxy, latency, bandwidth, packet_loss, jitter in results:
+                if proxy and latency:
+                    proxy.update_score(latency, packet_loss, jitter, True, bandwidth)
+                    POOL.add(proxy)
+                elif proxy:
+                    proxy.update_score(success=False)
+                    POOL.ban(proxy.proxy_str)
+        except Exception as e:
+            logging.error(f"Proxy refresh failed: {e}")
+    POOL.last_refresh = time.time()
+    logging.info(f"Proxies refreshed: {len(POOL.pool)} active")
+
+# VPN Service (Optional WireGuard)
+class VPNService:
+    def __init__(self):
+        self.current_proxy_chain = None
+        self.wg_up = False
+        self.active = True
+        self.lock = threading.Lock()
+        self.bandwidth_usage = 0
+        self.last_bandwidth_check = time.time()
+        self.mtu = 1280
+        self.stats = {"latency": deque(maxlen=50), "loss": deque(maxlen=50), "jitter": deque(maxlen=50)}
+        if CONFIG["use_vpn"] and os.geteuid() == 0:
+            threading.Thread(target=self._manage_vpn, daemon=True, name="VPNManager").start()
+            threading.Thread(target=self._monitor_bandwidth, daemon=True, name="BandwidthMonitor").start()
+            threading.Thread(target=self._adjust_traffic_shaping, daemon=True, name="TrafficShaper").start()
+
+    def _setup_wireguard(self) -> bool:
+        if not CONFIG["use_vpn"] or os.name != 'posix' or os.geteuid() != 0:
+            return False
+        wg_priv = urlsafe_b64encode(TITAN_CRYPTO.tor_key).decode()
+        wg_pub = urlsafe_b64encode(hashlib.sha256(TITAN_CRYPTO.tor_key).digest()).decode()
+        conf = f"""
+[Interface]
+PrivateKey = {wg_priv}
+Address = 10.0.0.{random.randint(2, 254)}/24
+ListenPort = 51820
+MTU = {self.mtu}
+
+[Peer]
+PublicKey = {wg_pub}
+Endpoint = 127.0.0.1:51820
+AllowedIPs = {','.join(CONFIG["allowed_routes"])}
+"""
+        with open("wg-tor.conf", "w") as f:
+            f.write(conf)
+        try:
+            subprocess.run(["wg-quick", "up", "wg-tor"], check=True, capture_output=True)
+            self.wg_up = True
+            logging.info(f"WireGuard activated with MTU {self.mtu}")
+            return True
+        except subprocess.CalledProcessError:
+            return False
+
+    def _teardown_wireguard(self):
+        if self.wg_up:
+            subprocess.run(["wg-quick", "down", "wg-tor"], check=False, capture_output=True)
+            self.wg_up = False
+            logging.info("WireGuard deactivated")
+
+    def _lock_network(self):
+        if os.name != 'posix' or os.geteuid() != 0:
+            return
+        try:
+            subprocess.run(["iptables", "-F"], check=True)
+            for route in CONFIG["allowed_routes"]:
+                subprocess.run(["iptables", "-A", "OUTPUT", "-d", route, "-j", "DROP"], check=True)
+            for bypass in CONFIG["bypass_routes"]:
+                subprocess.run(["iptables", "-A", "OUTPUT", "-d", bypass, "-j", "ACCEPT"], check=True)
+            if self.wg_up:
+                subprocess.run(["iptables", "-A", "OUTPUT", "-o", "wg-tor", "-j", "ACCEPT"], check=True)
+            subprocess.run(["iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"], check=True)
+            if CONFIG["obfuscation"]:
+                subprocess.run(["iptables", "-t", "mangle", "-A", "POSTROUTING", "-p", "tcp", "--tcp-flags", "SYN,RST,ACK", "SYN", "-j", "TCPMSS", f"--set-mss {self.mtu - 40}"], check=True)
+            logging.info("Network locked")
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Network lock failed: {e}")
+
+    def _unlock_network(self):
+        if os.name != 'posix' or os.geteuid() != 0:
+            return
+        subprocess.run(["iptables", "-F"], check=False)
+        subprocess.run(["iptables", "-t", "mangle", "-F"], check=False)
+        logging.info("Network unlocked")
+
+    async def _test_connection(self) -> Tuple[bool, float, float]:
+        async with aiohttp.ClientSession(headers={"User-Agent": random.choice(CONFIG["user_agents"])}) as session:
+            try:
+                start = time.time()
+                latencies = []
+                for _ in range(3):
+                    async with session.get(CONFIG["test_urls"][0], proxy=f"socks5://127.0.0.1:{CONFIG['tor_port']}",
+                                         timeout=aiohttp.ClientTimeout(total=CONFIG["timeout"])) as resp:
+                        if resp.status == 200:
+                            latencies.append(time.time() - start)
+                            start = time.time()
+                if not latencies:
+                    return False, 0.5, 0.0
+                latency = sum(latencies) / len(latencies)
+                jitter = max(latencies) - min(latencies) if len(latencies) > 1 else 0.0
+                self.bandwidth_usage += len(await resp.read())
+                packet_loss = await POOL._measure_packet_loss(f"socks5://127.0.0.1:{CONFIG['tor_port']}")
+                self.stats["latency"].append(latency)
+                self.stats["loss"].append(packet_loss)
+                self.stats["jitter"].append(jitter)
+                return True, packet_loss, jitter
+            except:
+                return False, 0.5, 0.0
+
+    def _monitor_bandwidth(self):
+        while self.active:
+            with self.lock:
+                elapsed = time.time() - self.last_bandwidth_check
+                if elapsed > 0:
+                    mbps = (self.bandwidth_usage * 8 / 1e6) / elapsed
+                    if mbps > CONFIG["max_bandwidth_mbps"]:
+                        logging.warning(f"Bandwidth {mbps:.2f} Mbps exceeds limit")
+                        time.sleep(3)
+                    self.bandwidth_usage = 0
+                    self.last_bandwidth_check = time.time()
+            time.sleep(3)
+
+    def _adjust_traffic_shaping(self):
+        while self.active:
+            with self.lock:
+                if self.stats["latency"] and CONFIG["traffic_shaping"]:
+                    avg_latency = sum(self.stats["latency"]) / len(self.stats["latency"]) if self.stats["latency"] else 0.0
+                    avg_loss = sum(self.stats["loss"]) / len(self.stats["loss"]) if self.stats["loss"] else 0.0
+                    if avg_latency > 0.5 or avg_loss > 0.2:
+                        self.mtu = max(1200, self.mtu - 40)
+                    elif avg_latency < 0.1 and avg_loss < 0.05:
+                        self.mtu = min(1420, self.mtu + 20)
+                    if self.wg_up:
+                        subprocess.run(["ip", "link", "set", "wg-tor", "mtu", str(self.mtu)], check=False)
+                    logging.debug(f"MTU adjusted to {self.mtu} (latency={avg_latency:.3f}, loss={avg_loss:.2f})")
+            self._lock_network()
+            time.sleep(10)
+
+    def _manage_vpn(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._lock_network()
+        while self.active and CONFIG["use_vpn"]:
+            if POOL.needs_refresh():
+                loop.run_until_complete(refresh_proxies())
+            with self.lock:
+                connected, packet_loss, jitter = loop.run_until_complete(self._test_connection())
+                avg_loss = sum(self.stats["loss"]) / max(1, len(self.stats["loss"]))
+                avg_jitter = sum(self.stats["jitter"]) / max(1, len(self.stats["jitter"]))
+                if not connected or avg_loss > 0.35 or avg_jitter > 0.1:
+                    if not self.wg_up:
+                        self._teardown_wireguard()
+                        if not self._setup_wireguard():
+                            self.current_proxy_chain = POOL.get_best(CONFIG["proxy_chain_depth"]) or [random.choice(CONFIG["fallback_proxies"])]
+                self._lock_network()
+            time.sleep(15)
+
+VPN_SERVICE = VPNService()
+
+# TOR Proxy Server
+class TORProxyServer:
+    def __init__(self, host='127.0.0.1', port=CONFIG["local_proxy_port"]):
+        self.host = host
+        self.port = port
+        self.current_proxy_chain = None
+        self.lock = threading.Lock()
+        self.active = True
+        threading.Thread(target=self._monitor_tor, daemon=True, name="TorMonitor").start()
+
+    async def _test_tor(self):
+        try:
+            async with aiohttp.ClientSession(headers={"User-Agent": random.choice(CONFIG["user_agents"])}) as session:
+                async with session.get(CONFIG["test_urls"][0], proxy=f"socks5://127.0.0.1:{CONFIG['tor_port']}",
+                                     timeout=aiohttp.ClientTimeout(total=CONFIG["timeout"])) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("isTor", False)
+        except:
+            return False
+
+    def _monitor_tor(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        while self.active:
+            with self.lock:
+                if not TOR.active or not loop.run_until_complete(self._test_tor()):
+                    logging.warning("TOR offline, switching to fallback")
+                    if POOL.needs_refresh():
+                        loop.run_until_complete(refresh_proxies())
+                    self.current_proxy_chain = POOL.get_best(CONFIG["proxy_chain_depth"]) or [random.choice(CONFIG["fallback_proxies"])]
+                else:
+                    self.current_proxy_chain = None
+                logging.info(f"Current routing: {'TOR' if not self.current_proxy_chain else 'fallback chain'}")
+            time.sleep(30)
+
+    async def handle_client(self, reader, writer):
+        data = await reader.read(32768)
+        if not data:
+            writer.close()
+            return
+        try:
+            if CONFIG["obfuscation"]:
+                data = self._obfuscate_data(data)
+            if VPN_SERVICE.wg_up:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.connect(('www.torproject.org', 80))
+            elif self.current_proxy_chain:
+                sock = socks.socksocket()
+                for proxy in reversed(self.current_proxy_chain):
+                    protocol, addr = proxy.split("://")
+                    host, port = addr.split(":")
+                    sock.set_proxy(socks.SOCKS5 if protocol == "socks5" else socks.HTTP, host, int(port))
+                sock.connect(('www.torproject.org', 80))
+            else:
+                sock = socks.socksocket()
+                sock.set_proxy(socks.SOCKS5, "127.0.0.1", CONFIG["tor_port"])
+                sock.connect(('www.torproject.org', 80))
+            sock.sendall(data)
+            response = sock.recv(131072)
+            VPN_SERVICE.bandwidth_usage += len(data) + len(response)
+            sock.close()
+            if CONFIG["obfuscation"]:
+                response = self._obfuscate_data(response)
+            writer.write(response)
+            await writer.drain()
+        except Exception as e:
+            logging.error(f"Proxy server error: {e}")
+        finally:
+            writer.close()
+
+    def _obfuscate_data(self, data: bytes) -> bytes:
+        padding = os.urandom(random.randint(32, 128))
+        jitter = random.uniform(0.001, 0.005)
+        time.sleep(jitter)
+        return padding + data + hashlib.sha256(padding).digest()[:16]
+
+    async def run(self):
+        server = await asyncio.start_server(self.handle_client, self.host, self.port)
+        logging.info(f"Proxy server running on {self.host}:{self.port}")
+        async with server:
+            await server.serve_forever()
+
+# Kill Switch and System Monitor
+def trigger_kill_switch():
+    logging.critical("Kill switch activated")
+    TOR.stop_tor()
+    VPN_SERVICE.active = False
+    VPN_SERVICE._teardown_wireguard()
+    VPN_SERVICE._unlock_network()
+    TOR_PROXY_SERVER.active = False
+    for f in [CONFIG["key_file"], CONFIG["session_file"], "wg-tor.conf"]:
+        if os.path.exists(f):
+            with open(f, 'wb') as fd:
+                fd.write(os.urandom(os.path.getsize(f) or 2048))
+            os.remove(f)
+    logging.shutdown()
+    sys.exit(1)
+
+def monitor_system():
+    while True:
+        mem = psutil.virtual_memory().percent
+        cpu = psutil.cpu_percent(interval=1)
+        disk = psutil.disk_usage('/').percent
+        net = psutil.net_io_counters()
+        if mem > 94 or cpu > 94 or disk > 96 or net.dropin > 2000:
+            logging.critical(f"System critical: Mem {mem}%, CPU {cpu}%, Disk {disk}%, Drops {net.dropin}")
+            trigger_kill_switch()
+        time.sleep(10)
+
+threading.Thread(target=monitor_system, daemon=True, name="SystemMonitor").start()
+
+# Main Loop
+async def main():
+    TITAN_CRYPTO._rotate_keys()
+    await refresh_proxies()
+    global TOR_PROXY_SERVER
+    TOR_PROXY_SERVER = TORProxyServer()
+    await TOR_PROXY_SERVER.run()
+
+def signal_handler(sig, frame):
+    logging.info(f"Signal {sig} received")
+    trigger_kill_switch()
+
+if __name__ == "__main__":
+    import signal
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    asyncio.run(main())
